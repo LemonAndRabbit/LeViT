@@ -11,6 +11,7 @@ import utils
 
 from timm.models.vision_transformer import trunc_normal_
 from timm.models.registry import register_model
+from timm.models.efficientnet_blocks import InvertedResidual
 
 specification = {
     'LeViT_128S': {
@@ -184,6 +185,89 @@ class Residual(torch.nn.Module):
                                               device=x.device).ge_(self.drop).div(1 - self.drop).detach()
         else:
             return x + self.m(x)
+
+
+class MixedAttention_Type1(torch.nn.Module):
+    def __init__(self, dim, key_dim, num_heads=8,
+                 attn_ratio=4,
+                 activation=None,
+                 resolution=14,
+                 conv_ratio=0.5):
+        super().__init__()
+        self.attention_heads = num_heads // 2
+        self.num_heads = num_heads
+        self.resolution = resolution
+
+        # In the Attention Branch
+        self.scale = key_dim ** -0.5
+        self.key_dim = key_dim
+        self.nh_kd = nh_kd = key_dim * self.attention_heads
+        self.d = int(attn_ratio * key_dim)
+        self.dh = int(attn_ratio * key_dim) * self.attention_heads
+        self.attn_ratio = attn_ratio
+        h = self.dh + nh_kd * 2
+        self.qkv = Linear_BN(dim, h, resolution=resolution)
+
+        # In the Conv Branch
+        self.Conv = InvertedResidual(dim, dim, 3, 1, 1, pad_type='same', exp_ratio=conv_ratio, noskip=True)
+
+        # In the Converge Tail
+        self.d_converge = self.dh + dim
+        self.proj = torch.nn.Sequential(activation(), Linear_BN(
+            self.d_converge, dim, bn_weight_init=0, resolution=resolution))
+
+        points = list(itertools.product(range(resolution), range(resolution)))
+        N = len(points)
+        attention_offsets = {}
+        idxs = []
+        for p1 in points:
+            for p2 in points:
+                offset = (abs(p1[0] - p2[0]), abs(p1[1] - p2[1]))
+                if offset not in attention_offsets:
+                    attention_offsets[offset] = len(attention_offsets)
+                idxs.append(attention_offsets[offset])
+        self.attention_biases = torch.nn.Parameter(
+            torch.zeros(self.attention_heads, len(attention_offsets)))
+        self.register_buffer('attention_bias_idxs',
+                             torch.LongTensor(idxs).view(N, N))
+
+    @torch.no_grad()
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and hasattr(self, 'ab'):
+            del self.ab
+        else:
+            self.ab = self.attention_biases[:, self.attention_bias_idxs]
+
+    def forward(self, x: torch.Tensor):  # x (B,N,C)
+        B, N, C = x.shape
+
+        # the attention branch
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, N, self.attention_heads, -
+                           1).split([self.key_dim, self.key_dim, self.d], dim=3)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        attn = (
+            (q @ k.transpose(-2, -1)) * self.scale
+            +
+            (self.attention_biases[:, self.attention_bias_idxs]
+             if self.training else self.ab)
+        )
+        attn = attn.softmax(dim=-1)
+        x1 = (attn @ v).transpose(1, 2).reshape(B, N, self.dh)
+
+        # the convolution branch
+        x = x.permute((0, 2, 1)).reshape((B, C, self.resolution, self.resolution)) # B, C, H, W
+        x = self.Conv(x)
+        x = x.reshape((B, C, N)).permute((0, 2, 1))
+
+        # the merge tail
+        x = torch.cat((x, x1), dim=-1)
+        x = self.proj(x)
+        return x
 
 
 class Attention(torch.nn.Module):
@@ -391,7 +475,7 @@ class LeViT(torch.nn.Module):
                 zip(embed_dim, key_dim, depth, num_heads, attn_ratio, mlp_ratio, down_ops)):
             for _ in range(dpth):
                 self.blocks.append(
-                    Residual(Attention(
+                    Residual(MixedAttention_Type1(
                         ed, kd, nh,
                         attn_ratio=ar,
                         activation=attention_activation,
@@ -463,7 +547,7 @@ def model_factory(C, D, X, N, drop_path, weights,
     embed_dim = [int(x) for x in C.split('_')]
     num_heads = [int(x) for x in N.split('_')]
     depth = [int(x) for x in X.split('_')]
-    act = torch.nn.Hardswish
+    act = torch.nn.ReLU
     model = LeViT(
         patch_size=16,
         embed_dim=embed_dim,
